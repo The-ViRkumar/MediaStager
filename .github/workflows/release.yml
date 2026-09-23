@@ -1,0 +1,92 @@
+name: Release
+
+# Push a version tag to build and publish standalone executables for
+# Windows, macOS, and Linux in one shot:
+#
+#   git tag v1.1.0
+#   git push origin v1.1.0
+#
+# "workflow_dispatch" lets you also trigger a one-off test build from the
+# Actions tab without tagging (its output is named after the branch, not
+# a version — real releases should always go through a tag).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: windows.exe
+            dist_name: MediaStager.exe
+            icon_args: --icon assets/icon.ico
+            data_sep: ";"
+          - os: macos-latest
+            asset_name: macos
+            dist_name: MediaStager
+            icon_args: --icon assets/icon.icns
+            data_sep: ":"
+          - os: ubuntu-latest
+            asset_name: linux
+            dist_name: MediaStager
+            icon_args: ""
+            data_sep: ":"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Tk (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        shell: bash
+        run: >
+          pyinstaller --noconsole --onefile --name MediaStager
+          ${{ matrix.icon_args }}
+          --add-data "assets${{ matrix.data_sep }}assets"
+          --collect-all guessit --collect-all babelfish --collect-all sv_ttk
+          main.py
+
+      - name: Package with version in the filename
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "dist/${{ matrix.dist_name }}" "out/MediaStager-${GITHUB_REF_NAME}-${{ matrix.asset_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaStager-${{ matrix.asset_name }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

@@ -1,0 +1,3 @@
+guessit>=3.8.0
+requests>=2.31.0
+sv-ttk>=2.6.0
