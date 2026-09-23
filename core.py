@@ -153,11 +153,6 @@ def suggest_title_year_folder(title: str, year: Optional[int]) -> str:
     return f"{title} ({year})" if year else title
 
 
-def suggest_season_folder_name(season: int) -> str:
-    """Jellyfin folder convention: 'Season 01', or 'Specials' for season 0."""
-    return "Specials" if season == 0 else f"Season {season:02d}"
-
-
 def find_sidecars(video_path: Path, siblings: list[Path]) -> list[Path]:
     """Files sharing the video's filename stem as a prefix (subtitles with
     language tags, .nfo, per-episode thumbs, etc.), excluding other videos."""
@@ -276,6 +271,7 @@ class PendingResolve:
 class PendingChoice:
     key: str
     kind: str  # "series" | "movie"
+    query: str  # original-case title, for display
     candidates: list[dict]
     items: list[PendingResolve] = field(default_factory=list)
 
@@ -368,7 +364,6 @@ class Row:
 class ScanResult:
     rows: list[Row]
     folder_name: Optional[str] = None       # suggested name for target_dir itself
-    seasons: list[int] = field(default_factory=list)  # distinct seasons found (series only)
     pending: list[PendingChoice] = field(default_factory=list)  # ambiguous TMDB titles
 
 
@@ -379,11 +374,15 @@ def _append_sidecars(rows: list[Row], video: Path, new_video_name: str,
         rows.append(Row(original=sc, proposed=sidecar_new_name(video, new_video_name, sc), row_type="Sidecar"))
 
 
+_SEASON_FOLDER_RE = re.compile(r"^(season\s*\d+|specials?)$", re.IGNORECASE)
+
+
 def split_into_shows(target_dir: Path) -> list[Path]:
     """For a library folder containing several shows/movies: returns one
     Path per immediate subfolder that (recursively) contains video files.
-    If target_dir itself directly contains videos, it's already a single
-    show/season/movie folder, so it's returned as-is (no split needed)."""
+    If target_dir itself directly contains videos, or its subfolders are
+    just that one show's own season folders (Season 1, Season 2, ...), it's
+    already a single show/movie folder, so it's returned as-is unsplit."""
     has_direct_videos = any(f.is_file() and f.suffix.lower() in VIDEO_EXTS for f in target_dir.iterdir())
     if has_direct_videos:
         return [target_dir]
@@ -391,7 +390,9 @@ def split_into_shows(target_dir: Path) -> list[Path]:
     subdirs = [d for d in target_dir.iterdir() if d.is_dir()]
     shows = [d for d in subdirs
              if any(f.suffix.lower() in VIDEO_EXTS for f in d.rglob("*") if f.is_file())]
-    return shows if shows else [target_dir]
+    if not shows or all(_SEASON_FOLDER_RE.match(d.name) for d in shows):
+        return [target_dir]
+    return shows
 
 
 def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: Optional[str] = None,
@@ -402,7 +403,6 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
     rows: list[Row] = []
     folder_title: Optional[str] = None
     folder_year: Optional[int] = None
-    seasons_seen: set[int] = set()
     claimed_sidecars: set[Path] = set()
     pending_by_key: dict[str, PendingChoice] = {}
     candidate_cache: dict[str, list[dict]] = {}
@@ -428,7 +428,8 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
                 if len(candidates) > 1:
                     new_name = build_movie_filename(parsed, video.suffix, title_override)
                     row = Row(original=video, proposed=new_name, row_type="Video")
-                    choice = pending_by_key.setdefault(key, PendingChoice(key=key, kind="movie", candidates=candidates))
+                    choice = pending_by_key.setdefault(
+                        key, PendingChoice(key=key, kind="movie", query=parsed.title, candidates=candidates))
                     choice.items.append(PendingResolve(row=row, ext=video.suffix, title_override=title_override))
                     rows.append(row)
                     if sync_sidecars:
@@ -450,7 +451,6 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
             if folder_title is None:
                 folder_title = (title_override.strip() if title_override else parsed.title)
                 folder_year = parsed.year
-            seasons_seen.add(parsed.season)
 
             episode_title = None
             if tmdb_key:
@@ -459,7 +459,8 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
                 if len(candidates) > 1:
                     new_name = build_filename(parsed, video.suffix, None, title_override)
                     row = Row(original=video, proposed=new_name, row_type="Video")
-                    choice = pending_by_key.setdefault(key, PendingChoice(key=key, kind="series", candidates=candidates))
+                    choice = pending_by_key.setdefault(
+                        key, PendingChoice(key=key, kind="series", query=parsed.title, candidates=candidates))
                     choice.items.append(PendingResolve(row=row, ext=video.suffix, title_override=title_override,
                                                          parsed=parsed))
                     rows.append(row)
@@ -489,8 +490,7 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
                 rows.append(Row(original=f, proposed=new_art_name, row_type="Artwork"))
 
     folder_name = suggest_title_year_folder(folder_title, folder_year) if folder_title else None
-    return ScanResult(rows=rows, folder_name=folder_name, seasons=sorted(seasons_seen),
-                       pending=list(pending_by_key.values()))
+    return ScanResult(rows=rows, folder_name=folder_name, pending=list(pending_by_key.values()))
 
 
 def apply_rename(rows: list[Row], target_dir: Path, rename_folder_to: Optional[str] = None

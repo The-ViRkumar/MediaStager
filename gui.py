@@ -110,8 +110,7 @@ class TmdbPickerDialog(tk.Toplevel):
         self.result: dict | None = None
 
         kind_label = "show" if choice.kind == "series" else "movie"
-        query = choice.key.split(":", 1)[1]
-        ttk.Label(self, text=f'Multiple {kind_label} matches for "{query}":',
+        ttk.Label(self, text=f'Multiple {kind_label} matches for "{choice.query}":',
                   wraplength=380).pack(padx=12, pady=(12, 6), anchor="w")
 
         self.listbox = tk.Listbox(self, width=52, height=min(6, len(choice.candidates)), exportselection=False)

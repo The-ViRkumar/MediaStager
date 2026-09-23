@@ -88,12 +88,20 @@ Rebuilt from the ground up, inspired by
 
 ## Jellyfin naming reference
 
-This is exactly what MediaStager produces:
+What MediaStager renames things *to*:
 
-| | Folder | File |
+| | Show/movie folder | File |
 |---|---|---|
-| **Series** | `Show Name (2019)/Season 01/` | `Show Name S01E02.mkv` |
+| **Series** | `Show Name (2019)/` | `Show Name S01E02.mkv` |
 | **Movie** | `Movie Name (2008)/` | `Movie Name (2008).mkv` |
+
+Season subfolders (`Season 01/`, `Season 02/`, ...) are Jellyfin's own
+convention on top of this — MediaStager renames files and the top-level
+show/movie folder, but doesn't create or reorganize files into season
+subfolders. If your episodes are already split into `Season 01/`,
+`Season 02/` folders, point MediaStager at each one (or the show root, with
+[Auto-split](#auto-split-library-folder) if it holds multiple shows) and the
+season structure is left exactly as-is underneath the renamed show folder.
 
 ## Download
 
@@ -183,8 +191,10 @@ Checkbox next to Auto-split library folder. If it's on when you add a
 folder, and that folder doesn't contain videos directly but has
 subfolders that do (e.g. `TV Shows/Breaking Bad/...`, `TV Shows/The
 Office/...`), each subfolder is queued as its **own** item instead of the
-whole library being treated as one show. Turn it off if the folder you're
-adding *is* already a single show/season/movie folder.
+whole library being treated as one show. It's safe to leave on even when
+pointed at a single show's own root — subfolders named like `Season 01` or
+`Specials` are recognized as that one show's seasons, not separate shows,
+and won't be split.
 
 ### Add Multiple folders
 
@@ -341,6 +351,7 @@ pyinstaller --noconsole --onefile --name MediaStager $COLLECT --add-data "assets
 | `main.py` | Entry point. |
 | `assets/generate_icon.py` | Regenerates the app icon (dev-time only). |
 | `.github/workflows/release.yml` | Builds and publishes tagged multi-platform releases. |
+| `.github/RELEASE_NOTES.md` | Template body used for each GitHub Release. |
 
 ## Author
 
