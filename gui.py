@@ -1,6 +1,7 @@
 """MediaStager GUI — Tkinter/ttk, themed with sv_ttk."""
 from __future__ import annotations
 
+import csv
 import queue
 import sys
 import threading
@@ -9,11 +10,12 @@ import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-AUTHOR_URL = "https://github.com/The-ViRkumar"
-
 import sv_ttk
 
 import core
+
+AUTHOR_URL = "https://github.com/The-ViRkumar"
+RELEASES_URL = "https://github.com/The-ViRkumar/MediaStager/releases/latest"
 
 COLUMNS = ("include", "folder", "original", "proposed", "type")
 HEADINGS = {
@@ -45,11 +47,97 @@ class SettingsDialog(tk.Toplevel):
         btns = ttk.Frame(self)
         btns.grid(row=3, column=0, columnspan=2, pady=(6, 12))
         ttk.Button(btns, text="Save", command=self._save).pack(side="left", padx=6)
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="left", padx=6)
         entry.focus_set()
 
     def _save(self):
         self.master.tmdb_api_key = self.key_var.get().strip()
+        self.destroy()
+
+    def _cancel(self):
+        self.destroy()
+
+
+class AddMultipleDialog(tk.Toplevel):
+    """Paste several folder paths (one per line) and queue them all at once."""
+
+    def __init__(self, parent: "MediaStagerApp"):
+        super().__init__(parent)
+        self.title("Add Multiple Folders")
+        self.geometry("560x360")
+        self.transient(parent)
+        self.grab_set()
+
+        btns = ttk.Frame(self)
+        btns.pack(side="bottom", pady=12)
+        ttk.Button(btns, text="Add All", command=self._add_all, style="Accent.TButton").pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=6)
+
+        ttk.Label(self, text="One folder path per line:").pack(anchor="w", padx=12, pady=(12, 4))
+        self.text = tk.Text(self, wrap="none")
+        self.text.pack(fill="both", expand=True, padx=12)
+        self.text.focus_set()
+
+    def _add_all(self):
+        lines = [ln.strip() for ln in self.text.get("1.0", "end").splitlines() if ln.strip()]
+        if not lines:
+            self.destroy()
+            return
+        added, failed = 0, []
+        for line in lines:
+            count, msg = self.master._queue_path(line)
+            if count:
+                added += count
+            else:
+                failed.append(msg)
+        self.master._refresh_queue_tree()
+        self.destroy()
+        summary = f"Added {added} folder(s) to the queue."
+        if failed:
+            summary += f"\n\n{len(failed)} skipped:\n" + "\n".join(failed[:10])
+        messagebox.showinfo("MediaStager", summary)
+
+
+class TmdbPickerDialog(tk.Toplevel):
+    """Shown when a title has more than one plausible TMDB match."""
+
+    def __init__(self, parent: "MediaStagerApp", choice: core.PendingChoice):
+        super().__init__(parent)
+        self.title("Multiple TMDB Matches")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.result: dict | None = None
+
+        kind_label = "show" if choice.kind == "series" else "movie"
+        query = choice.key.split(":", 1)[1]
+        ttk.Label(self, text=f'Multiple {kind_label} matches for "{query}":',
+                  wraplength=380).pack(padx=12, pady=(12, 6), anchor="w")
+
+        self.listbox = tk.Listbox(self, width=52, height=min(6, len(choice.candidates)), exportselection=False)
+        for c in choice.candidates:
+            label = c["title"] + (f" ({c['year']})" if c["year"] else "")
+            self.listbox.insert("end", label)
+        self.listbox.selection_set(0)
+        self.listbox.pack(padx=12, pady=(0, 8))
+
+        self._candidates = choice.candidates
+        btns = ttk.Frame(self)
+        btns.pack(pady=(0, 12))
+        ttk.Button(btns, text="Use Selected", command=self._use_selected,
+                   style="Accent.TButton").pack(side="left", padx=6)
+        ttk.Button(btns, text="Keep Guessed Name", command=self._keep_guessed).pack(side="left", padx=6)
+
+        self.wait_window(self)
+
+    def _use_selected(self):
+        sel = self.listbox.curselection()
+        if sel:
+            self.result = self._candidates[sel[0]]
+        self.destroy()
+
+    def _keep_guessed(self):
+        self.result = None
         self.destroy()
 
 
@@ -57,9 +145,9 @@ class MediaStagerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MediaStager")
-        self.minsize(920, 600)
+        self.minsize(960, 620)
         self._set_icon()
-        self._center_window(1200, 760)
+        self._center_window(1200, 780)
 
         self.cfg = core.load_config()
         self.tmdb_api_key = ""  # session-only, never written to config.json
@@ -72,10 +160,16 @@ class MediaStagerApp(tk.Tk):
 
         self._build_top_bar()
         self._build_options_bar()
+        self._build_options_bar2()
         self._build_queue_panel()
         self._build_action_bar()
         self._build_table()
         self._build_bottom_bar()
+
+        self.after(200, self._poll_queue)
+        self._check_for_update_async()
+        if self.fetch_tmdb.get():
+            self._on_tmdb_toggle()
 
     def _center_window(self, width: int, height: int):
         x = (self.winfo_screenwidth() - width) // 2
@@ -104,34 +198,51 @@ class MediaStagerApp(tk.Tk):
         ttk.Label(bar, text="Target Directory:").pack(side="left")
         self.path_var = tk.StringVar()
         self.path_combo = ttk.Combobox(bar, textvariable=self.path_var,
-                                        values=self.cfg.get("recent_dirs", []), width=60)
+                                        values=self.cfg.get("recent_dirs", []), width=46)
         self.path_combo.pack(side="left", padx=8, fill="x", expand=True)
 
         ttk.Button(bar, text="Browse...", command=self._browse).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text="+ Add to Queue", command=self._add_to_queue).pack(side="left", padx=(4, 4))
+        ttk.Button(bar, text="+ Add to Queue", command=self._add_to_queue).pack(side="left", padx=(0, 4))
+        ttk.Button(bar, text="+ Add Multiple...", command=lambda: AddMultipleDialog(self)).pack(side="left")
         ttk.Checkbutton(bar, text="Dark Mode", variable=self.dark, command=self._toggle_theme,
                          style="Switch.TCheckbutton").pack(side="left", padx=(12, 0))
+
+        self.update_var = tk.StringVar(value="")
+        update_label = ttk.Label(bar, textvariable=self.update_var, foreground="#22c55e", cursor="hand2")
+        update_label.pack(side="right")
+        update_label.bind("<Button-1>", lambda _e: webbrowser.open(RELEASES_URL) if self.update_var.get() else None)
 
     def _build_options_bar(self):
         bar = ttk.Frame(self, padding=(12, 4, 12, 4))
         bar.pack(fill="x")
 
         ttk.Label(bar, text="Mode:").pack(side="left")
-        self.mode = tk.StringVar(value=core.MODE_SERIES)
+        self.mode = tk.StringVar(value=self.cfg.get("last_mode", core.MODE_SERIES))
         ttk.Radiobutton(bar, text="Series", variable=self.mode, value=core.MODE_SERIES).pack(side="left", padx=(4, 0))
         ttk.Radiobutton(bar, text="Movie", variable=self.mode, value=core.MODE_MOVIE).pack(side="left", padx=(4, 12))
 
-        self.sync_sidecars = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Sync Sidecars (.srt, .nfo, ...)",
-                         variable=self.sync_sidecars).pack(side="left")
+        self.sync_sidecars = tk.BooleanVar(value=self.cfg.get("last_sync_sidecars", False))
+        ttk.Checkbutton(bar, text="Sync Sidecars/Artwork", variable=self.sync_sidecars).pack(side="left")
 
-        self.fetch_tmdb = tk.BooleanVar(value=False)
+        self.fetch_tmdb = tk.BooleanVar(value=self.cfg.get("last_use_tmdb", False))
         ttk.Checkbutton(bar, text="Fetch Titles (TMDB)", variable=self.fetch_tmdb,
                          command=self._on_tmdb_toggle).pack(side="left", padx=(16, 0))
 
-        ttk.Label(bar, text="Title Override:").pack(side="left", padx=(16, 4))
+        self.multi_episode = tk.BooleanVar(value=self.cfg.get("last_multi_episode", True))
+        ttk.Checkbutton(bar, text="Multi-episode files", variable=self.multi_episode).pack(side="left", padx=(16, 0))
+
+        self.auto_split = tk.BooleanVar(value=self.cfg.get("last_auto_split", False))
+        ttk.Checkbutton(bar, text="Auto-split library folder", variable=self.auto_split).pack(side="left", padx=(16, 0))
+
+    def _build_options_bar2(self):
+        # Second row: title override on its own line so the first row doesn't crowd.
+        bar = ttk.Frame(self, padding=(12, 0, 12, 4))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Title Override:").pack(side="left")
         self.title_override = tk.StringVar()
-        ttk.Entry(bar, textvariable=self.title_override, width=22).pack(side="left")
+        ttk.Entry(bar, textvariable=self.title_override, width=30).pack(side="left", padx=(4, 0))
+        ttk.Label(bar, text="(applies to the next folder(s) you add to the queue)",
+                  foreground="#888888").pack(side="left", padx=(8, 0))
 
     def _build_queue_panel(self):
         frame = ttk.LabelFrame(self, text="Batch Queue", padding=(8, 4))
@@ -170,6 +281,8 @@ class MediaStagerApp(tk.Tk):
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._refresh_table())
         ttk.Entry(bar, textvariable=self.filter_var, width=24).pack(side="left")
+
+        ttk.Button(bar, text="Export CSV", command=self._export_csv).pack(side="left", padx=(16, 0))
 
     def _build_table(self):
         frame = ttk.Frame(self, padding=(12, 0, 12, 0))
@@ -231,34 +344,83 @@ class MediaStagerApp(tk.Tk):
         if directory:
             self.path_var.set(directory)
 
+    def _check_for_update_async(self):
+        def worker():
+            latest = core.check_for_update(core.APP_VERSION)
+            if latest:
+                self._work_queue.put(("update_available", latest))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _export_csv(self):
+        if not self.rows:
+            messagebox.showinfo("MediaStager", "Scan a directory first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+            initialfile="mediastager_rename_report.csv",
+        )
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Folder", "Original Name", "Proposed Name", "Type", "Included"])
+            for row in self.rows:
+                writer.writerow([self._folder_label(row), row.original.name, row.proposed,
+                                  row.row_type, "No" if row.excluded else "Yes"])
+        self.status_var.set(f"Exported {len(self.rows)} row(s) to {Path(path).name}.")
+
     # -- queue ------------------------------------------------------------
 
     def _queued_paths(self) -> set[str]:
         return {str(item.path.resolve()) for item in self.queue_items}
 
+    def _save_last_options(self):
+        self.cfg["last_mode"] = self.mode.get()
+        self.cfg["last_sync_sidecars"] = self.sync_sidecars.get()
+        self.cfg["last_use_tmdb"] = self.fetch_tmdb.get()
+        self.cfg["last_multi_episode"] = self.multi_episode.get()
+        self.cfg["last_auto_split"] = self.auto_split.get()
+
+    def _queue_path(self, directory: str) -> tuple[int, str]:
+        """Adds `directory` (optionally auto-split into per-show folders) to
+        the queue using the currently selected mode/options. Returns
+        (count_added, message) — message is only set when count_added is 0."""
+        path = Path(directory)
+        if not path.exists():
+            return 0, f"Not found: {directory}"
+
+        self.cfg = core.remember_directory(self.cfg, directory)
+        self._save_last_options()
+        core.save_config(self.cfg)
+        self.path_combo["values"] = self.cfg.get("recent_dirs", [])
+
+        targets = core.split_into_shows(path) if self.auto_split.get() else [path]
+        existing = self._queued_paths()
+        title_override = self.title_override.get().strip() or None
+        added = 0
+        for t in targets:
+            if str(t.resolve()) in existing:
+                continue
+            self.queue_items.append(core.QueueItem(
+                path=t,
+                mode=self.mode.get(),
+                sync_sidecars=self.sync_sidecars.get(),
+                use_tmdb=self.fetch_tmdb.get(),
+                title_override=title_override,
+                multi_episode=self.multi_episode.get(),
+            ))
+            existing.add(str(t.resolve()))
+            added += 1
+        return added, ""
+
     def _add_to_queue(self) -> bool:
         directory = self.path_var.get().strip()
         if not directory:
             return False
-        path = Path(directory)
-        if not path.exists():
-            messagebox.showerror("MediaStager", f"Directory not found:\n{directory}")
+        count, msg = self._queue_path(directory)
+        if count == 0 and msg:
+            messagebox.showerror("MediaStager", msg)
             return False
-        if str(path.resolve()) in self._queued_paths():
-            self.path_var.set("")
-            return True
-
-        self.cfg = core.remember_directory(self.cfg, directory)
-        core.save_config(self.cfg)
-        self.path_combo["values"] = self.cfg.get("recent_dirs", [])
-
-        self.queue_items.append(core.QueueItem(
-            path=path,
-            mode=self.mode.get(),
-            sync_sidecars=self.sync_sidecars.get(),
-            use_tmdb=self.fetch_tmdb.get(),
-            title_override=self.title_override.get().strip() or None,
-        ))
         self.path_var.set("")
         self._refresh_queue_tree()
         return True
@@ -365,35 +527,47 @@ class MediaStagerApp(tk.Tk):
             for item in pending:
                 try:
                     result = core.scan_directory(item.path, item.mode, item.sync_sidecars,
-                                                  tmdb_key if item.use_tmdb else None, item.title_override)
+                                                  tmdb_key if item.use_tmdb else None, item.title_override,
+                                                  multi_episode=item.multi_episode)
                     item.rows = result.rows
                     item.folder_name = result.folder_name
+                    item.pending = result.pending
                     item.status = f"Scanned ({len(result.rows)})"
                 except Exception as exc:  # surfaced to the user, not swallowed
                     item.status = f"Error: {exc}"
             self._work_queue.put(("scan_done", None))
 
         threading.Thread(target=worker, daemon=True).start()
-        self.after(100, self._poll_queue)
 
     def _poll_queue(self):
         try:
             kind, payload = self._work_queue.get_nowait()
         except queue.Empty:
-            self.after(100, self._poll_queue)
+            self.after(150, self._poll_queue)
             return
 
-        self.progress.stop()
         if kind == "scan_done":
+            self.progress.stop()
+            self._resolve_tmdb_ambiguities()
             self.rows = [row for item in self.queue_items for row in item.rows]
             self._refresh_queue_tree()
             self._refresh_table()
             to_rename = sum(1 for r in self.rows if not r.excluded)
             self.status_var.set(f"Found {len(self.rows)} file(s) in {to_rename} to rename "
                                  f"across {len(self.queue_items)} folder(s).")
-        elif kind == "scan_error":
-            messagebox.showerror("MediaStager", f"Scan failed:\n{payload}")
-            self.status_var.set("Scan failed.")
+        elif kind == "update_available":
+            self.update_var.set(f"⬆ Update available: {payload}")
+
+        self.after(150, self._poll_queue)
+
+    def _resolve_tmdb_ambiguities(self):
+        all_pending: list[core.PendingChoice] = []
+        for item in self.queue_items:
+            all_pending.extend(item.pending)
+            item.pending = []
+        for choice in all_pending:
+            dlg = TmdbPickerDialog(self, choice)
+            core.resolve_tmdb_choice(self.tmdb_api_key, choice, dlg.result)
 
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -407,7 +581,7 @@ class MediaStagerApp(tk.Tk):
             tags = []
             if row.excluded:
                 tags.append("excluded")
-            if row.row_type == "Sidecar":
+            if row.row_type in ("Sidecar", "Artwork"):
                 tags.append("sidecar")
             if row.proposed.startswith("(could not"):
                 tags.append("error")

@@ -1,4 +1,5 @@
-"""Core logic for MediaStager: parsing, sidecar matching, TMDB lookup, ledger.
+"""Core logic for MediaStager: parsing, sidecar/artwork matching, TMDB
+lookup, ledger, batch queue, and update checks.
 
 No GUI imports here on purpose — keeps this testable and reusable headless.
 """
@@ -13,7 +14,11 @@ from typing import Optional
 import requests
 from guessit import guessit
 
+APP_VERSION = "1.1.0"
+GITHUB_RELEASES_API = "https://api.github.com/repos/The-ViRkumar/MediaStager/releases/latest"
+
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 LEDGER_NAME = "mediastager_ledger.json"
 FOLDER_RENAME_KEY = "__folder_rename__"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -21,6 +26,16 @@ _INVALID_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 MODE_SERIES = "series"
 MODE_MOVIE = "movie"
+
+# Loose artwork files (Show-poster.jpg, fanart.png, ...) mapped to the
+# generic filename Jellyfin/Plex actually look for.
+ARTWORK_KEYWORDS = {
+    "poster": "poster", "cover": "poster",
+    "fanart": "fanart", "backdrop": "backdrop", "background": "backdrop",
+    "banner": "banner",
+    "clearlogo": "logo", "logo": "logo",
+    "clearart": "clearart",
+}
 
 TMDB_TV_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
 TMDB_EPISODE_URL = "https://api.themoviedb.org/3/tv/{show_id}/season/{season}/episode/{episode}"
@@ -33,7 +48,7 @@ def sanitize(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Config (recent directories, theme), stored next to the app.
+# Config (recent directories, theme, last-used options), stored next to the app.
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
@@ -65,6 +80,7 @@ class Parsed:
     title: str
     season: int
     episode: int
+    episode_end: Optional[int] = None  # set for a detected multi-episode range
     year: Optional[int] = None
 
 
@@ -74,7 +90,7 @@ class MovieParsed:
     year: Optional[int] = None
 
 
-def parse_episode(video_path: Path) -> Optional[Parsed]:
+def parse_episode(video_path: Path, multi_episode: bool = True) -> Optional[Parsed]:
     """Parse title/season/episode with guessit. Includes the parent folder
     name in the string handed to guessit so season-only-in-folder layouts
     (e.g. "Season 2/ep03.mkv") still resolve correctly."""
@@ -85,15 +101,21 @@ def parse_episode(video_path: Path) -> Optional[Parsed]:
     episode = info.get("episode")
     if not title or episode is None:
         return None
+
+    episode_end = None
     if isinstance(episode, list):
-        episode = episode[0]
+        if multi_episode and len(episode) > 1:
+            episode_end = int(max(episode))
+        episode = int(min(episode))
+    else:
+        episode = int(episode)
 
     season = info.get("season", 1)
     if isinstance(season, list):
         season = season[0]
 
     year = info.get("year")
-    return Parsed(title=str(title), season=int(season), episode=int(episode),
+    return Parsed(title=str(title), season=int(season), episode=episode, episode_end=episode_end,
                   year=int(year) if year else None)
 
 
@@ -109,7 +131,10 @@ def parse_movie(video_path: Path) -> Optional[MovieParsed]:
 def build_filename(parsed: Parsed, ext: str, episode_title: Optional[str] = None,
                     title_override: Optional[str] = None) -> str:
     title = title_override.strip() if title_override else parsed.title
-    base = f"{sanitize(title)} S{parsed.season:02d}E{parsed.episode:02d}"
+    ep_part = f"E{parsed.episode:02d}"
+    if parsed.episode_end:
+        ep_part += f"-E{parsed.episode_end:02d}"
+    base = f"{sanitize(title)} S{parsed.season:02d}{ep_part}"
     if episode_title:
         base += f" - {sanitize(episode_title)}"
     return f"{base}{ext}"
@@ -135,7 +160,7 @@ def suggest_season_folder_name(season: int) -> str:
 
 def find_sidecars(video_path: Path, siblings: list[Path]) -> list[Path]:
     """Files sharing the video's filename stem as a prefix (subtitles with
-    language tags, .nfo, etc.), excluding other video files."""
+    language tags, .nfo, per-episode thumbs, etc.), excluding other videos."""
     stem = video_path.stem
     out = []
     for f in siblings:
@@ -153,28 +178,63 @@ def sidecar_new_name(video_path: Path, new_video_name: str, sidecar_path: Path) 
     return f"{new_stem}{suffix}"
 
 
+def find_folder_artwork(folder: Path) -> list[tuple[Path, str]]:
+    """Loose artwork files (poster.jpg, Show-fanart.jpg, ...) that don't
+    already match a video's own stem, mapped to Jellyfin's canonical name."""
+    out = []
+    for f in folder.iterdir():
+        if not f.is_file() or f.suffix.lower() not in IMAGE_EXTS:
+            continue
+        stem_lower = f.stem.lower()
+        for keyword, canonical in ARTWORK_KEYWORDS.items():
+            if keyword in stem_lower:
+                new_name = f"{canonical}{f.suffix.lower()}"
+                if f.name != new_name:
+                    out.append((f, new_name))
+                break
+    return out
+
+
 # ---------------------------------------------------------------------------
 # TMDB enrichment
 # ---------------------------------------------------------------------------
 
-def fetch_episode_title(api_key: str, show_title: str, season: int, episode: int,
-                         timeout: float = 6.0) -> Optional[str]:
+def search_tv_candidates(api_key: str, query: str, limit: int = 5, timeout: float = 6.0) -> list[dict]:
     try:
-        search = requests.get(
-            TMDB_TV_SEARCH_URL,
-            params={"api_key": api_key, "query": show_title},
-            timeout=timeout,
-        )
-        search.raise_for_status()
-        results = search.json().get("results") or []
-        if not results:
-            return None
-        show_id = results[0]["id"]
+        r = requests.get(TMDB_TV_SEARCH_URL, params={"api_key": api_key, "query": query}, timeout=timeout)
+        r.raise_for_status()
+        results = r.json().get("results") or []
+    except (requests.RequestException, ValueError):
+        return []
+    out = []
+    for x in results[:limit]:
+        year_str = (x.get("first_air_date") or "")[:4]
+        out.append({"id": x["id"], "title": x.get("name") or query,
+                    "year": int(year_str) if year_str.isdigit() else None})
+    return out
 
+
+def search_movie_candidates(api_key: str, query: str, limit: int = 5, timeout: float = 6.0) -> list[dict]:
+    try:
+        r = requests.get(TMDB_MOVIE_SEARCH_URL, params={"api_key": api_key, "query": query}, timeout=timeout)
+        r.raise_for_status()
+        results = r.json().get("results") or []
+    except (requests.RequestException, ValueError):
+        return []
+    out = []
+    for x in results[:limit]:
+        year_str = (x.get("release_date") or "")[:4]
+        out.append({"id": x["id"], "title": x.get("title") or query,
+                    "year": int(year_str) if year_str.isdigit() else None})
+    return out
+
+
+def fetch_episode_title_by_show_id(api_key: str, show_id: int, season: int, episode: int,
+                                    timeout: float = 6.0) -> Optional[str]:
+    try:
         ep = requests.get(
             TMDB_EPISODE_URL.format(show_id=show_id, season=season, episode=episode),
-            params={"api_key": api_key},
-            timeout=timeout,
+            params={"api_key": api_key}, timeout=timeout,
         )
         ep.raise_for_status()
         return ep.json().get("name") or None
@@ -182,25 +242,59 @@ def fetch_episode_title(api_key: str, show_title: str, season: int, episode: int
         return None
 
 
-def fetch_movie_info(api_key: str, title: str, timeout: float = 6.0) -> Optional[MovieParsed]:
-    """Looks up the canonical title/year for a movie. Used to correct sloppy
-    filenames when TMDB lookups are enabled in movie mode."""
-    try:
-        r = requests.get(
-            TMDB_MOVIE_SEARCH_URL,
-            params={"api_key": api_key, "query": title},
-            timeout=timeout,
-        )
-        r.raise_for_status()
-        results = r.json().get("results") or []
-        if not results:
-            return None
-        top = results[0]
-        release = top.get("release_date") or ""
-        year = int(release[:4]) if release[:4].isdigit() else None
-        return MovieParsed(title=top.get("title") or title, year=year)
-    except (requests.RequestException, KeyError, ValueError):
+def fetch_episode_title(api_key: str, show_title: str, season: int, episode: int,
+                         timeout: float = 6.0) -> Optional[str]:
+    candidates = search_tv_candidates(api_key, show_title, limit=1, timeout=timeout)
+    if not candidates:
         return None
+    return fetch_episode_title_by_show_id(api_key, candidates[0]["id"], season, episode, timeout)
+
+
+def fetch_movie_info(api_key: str, title: str, timeout: float = 6.0) -> Optional[MovieParsed]:
+    """Looks up the canonical title/year for a movie."""
+    candidates = search_movie_candidates(api_key, title, limit=1, timeout=timeout)
+    if not candidates:
+        return None
+    c = candidates[0]
+    return MovieParsed(title=c["title"], year=c["year"])
+
+
+# ---------------------------------------------------------------------------
+# TMDB result picker — collected during a scan when a title has more than
+# one plausible match, resolved by the GUI (or left as the guessed name).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PendingResolve:
+    row: "Row"
+    ext: str
+    title_override: Optional[str] = None
+    parsed: Optional[Parsed] = None  # set for kind == "series"
+
+
+@dataclass
+class PendingChoice:
+    key: str
+    kind: str  # "series" | "movie"
+    candidates: list[dict]
+    items: list[PendingResolve] = field(default_factory=list)
+
+
+def resolve_tmdb_choice(api_key: str, choice: PendingChoice, candidate: Optional[dict]) -> None:
+    """Applies the user's pick to every row sharing this ambiguous title.
+    candidate=None keeps each row's already-proposed (guessed) name."""
+    if candidate is None:
+        return
+    for item in choice.items:
+        if choice.kind == "movie":
+            parsed = MovieParsed(title=candidate["title"], year=candidate["year"])
+            item.row.proposed = build_movie_filename(parsed, item.ext, item.title_override)
+        else:
+            ep_title = fetch_episode_title_by_show_id(api_key, candidate["id"],
+                                                        item.parsed.season, item.parsed.episode)
+            resolved = Parsed(title=candidate["title"], season=item.parsed.season,
+                               episode=item.parsed.episode, episode_end=item.parsed.episode_end)
+            item.row.proposed = build_filename(resolved, item.ext, ep_title, item.title_override)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +360,7 @@ def undo_last_batch(target_dir: Path) -> tuple[int, list[str], Path]:
 class Row:
     original: Path
     proposed: str
-    row_type: str  # "Video" or "Sidecar"
+    row_type: str  # "Video", "Sidecar", or "Artwork"
     excluded: bool = False
 
 
@@ -275,10 +369,33 @@ class ScanResult:
     rows: list[Row]
     folder_name: Optional[str] = None       # suggested name for target_dir itself
     seasons: list[int] = field(default_factory=list)  # distinct seasons found (series only)
+    pending: list[PendingChoice] = field(default_factory=list)  # ambiguous TMDB titles
+
+
+def _append_sidecars(rows: list[Row], video: Path, new_video_name: str,
+                      siblings: list[Path], claimed: set[Path]) -> None:
+    for sc in find_sidecars(video, siblings):
+        claimed.add(sc)
+        rows.append(Row(original=sc, proposed=sidecar_new_name(video, new_video_name, sc), row_type="Sidecar"))
+
+
+def split_into_shows(target_dir: Path) -> list[Path]:
+    """For a library folder containing several shows/movies: returns one
+    Path per immediate subfolder that (recursively) contains video files.
+    If target_dir itself directly contains videos, it's already a single
+    show/season/movie folder, so it's returned as-is (no split needed)."""
+    has_direct_videos = any(f.is_file() and f.suffix.lower() in VIDEO_EXTS for f in target_dir.iterdir())
+    if has_direct_videos:
+        return [target_dir]
+
+    subdirs = [d for d in target_dir.iterdir() if d.is_dir()]
+    shows = [d for d in subdirs
+             if any(f.suffix.lower() in VIDEO_EXTS for f in d.rglob("*") if f.is_file())]
+    return shows if shows else [target_dir]
 
 
 def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: Optional[str] = None,
-                    title_override: Optional[str] = None) -> ScanResult:
+                    title_override: Optional[str] = None, multi_episode: bool = True) -> ScanResult:
     all_files = [f for f in target_dir.rglob("*") if f.is_file() and f.name != LEDGER_NAME]
     videos = [f for f in all_files if f.suffix.lower() in VIDEO_EXTS]
 
@@ -286,6 +403,9 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
     folder_title: Optional[str] = None
     folder_year: Optional[int] = None
     seasons_seen: set[int] = set()
+    claimed_sidecars: set[Path] = set()
+    pending_by_key: dict[str, PendingChoice] = {}
+    candidate_cache: dict[str, list[dict]] = {}
 
     for video in videos:
         siblings = [f for f in all_files if f.parent == video.parent]
@@ -296,47 +416,81 @@ def scan_directory(target_dir: Path, mode: str, sync_sidecars: bool, tmdb_key: O
                 rows.append(Row(original=video, proposed="(could not detect movie)",
                                  row_type="Video", excluded=True))
                 continue
-            if tmdb_key:
-                canonical = fetch_movie_info(tmdb_key, parsed.title)
-                if canonical:
-                    parsed = MovieParsed(title=canonical.title, year=canonical.year or parsed.year)
 
             if folder_title is None:
                 folder_title = (title_override.strip() if title_override else parsed.title)
                 folder_year = parsed.year
 
+            candidates = None
+            if tmdb_key:
+                key = f"movie:{parsed.title.lower()}"
+                candidates = candidate_cache.setdefault(key, search_movie_candidates(tmdb_key, parsed.title))
+                if len(candidates) > 1:
+                    new_name = build_movie_filename(parsed, video.suffix, title_override)
+                    row = Row(original=video, proposed=new_name, row_type="Video")
+                    choice = pending_by_key.setdefault(key, PendingChoice(key=key, kind="movie", candidates=candidates))
+                    choice.items.append(PendingResolve(row=row, ext=video.suffix, title_override=title_override))
+                    rows.append(row)
+                    if sync_sidecars:
+                        _append_sidecars(rows, video, new_name, siblings, claimed_sidecars)
+                    continue
+                if candidates:
+                    parsed = MovieParsed(title=candidates[0]["title"], year=candidates[0]["year"] or parsed.year)
+
             new_name = build_movie_filename(parsed, video.suffix, title_override)
             rows.append(Row(original=video, proposed=new_name, row_type="Video"))
 
         else:
-            parsed = parse_episode(video)
+            parsed = parse_episode(video, multi_episode=multi_episode)
             if parsed is None:
                 rows.append(Row(original=video, proposed="(could not detect episode)",
                                  row_type="Video", excluded=True))
                 continue
-
-            episode_title = None
-            if tmdb_key:
-                episode_title = fetch_episode_title(tmdb_key, parsed.title, parsed.season, parsed.episode)
 
             if folder_title is None:
                 folder_title = (title_override.strip() if title_override else parsed.title)
                 folder_year = parsed.year
             seasons_seen.add(parsed.season)
 
+            episode_title = None
+            if tmdb_key:
+                key = f"series:{parsed.title.lower()}"
+                candidates = candidate_cache.setdefault(key, search_tv_candidates(tmdb_key, parsed.title))
+                if len(candidates) > 1:
+                    new_name = build_filename(parsed, video.suffix, None, title_override)
+                    row = Row(original=video, proposed=new_name, row_type="Video")
+                    choice = pending_by_key.setdefault(key, PendingChoice(key=key, kind="series", candidates=candidates))
+                    choice.items.append(PendingResolve(row=row, ext=video.suffix, title_override=title_override,
+                                                         parsed=parsed))
+                    rows.append(row)
+                    if sync_sidecars:
+                        _append_sidecars(rows, video, new_name, siblings, claimed_sidecars)
+                    continue
+                if candidates:
+                    episode_title = fetch_episode_title_by_show_id(tmdb_key, candidates[0]["id"],
+                                                                    parsed.season, parsed.episode)
+
             new_name = build_filename(parsed, video.suffix, episode_title, title_override)
             rows.append(Row(original=video, proposed=new_name, row_type="Video"))
 
         if sync_sidecars:
-            for sc in find_sidecars(video, siblings):
-                rows.append(Row(
-                    original=sc,
-                    proposed=sidecar_new_name(video, new_name, sc),
-                    row_type="Sidecar",
-                ))
+            _append_sidecars(rows, video, new_name, siblings, claimed_sidecars)
+
+    if sync_sidecars:
+        artwork_dirs = {target_dir} | {v.parent for v in videos}
+        seen_artwork: set[Path] = set()
+        for d in artwork_dirs:
+            if not d.exists():
+                continue
+            for f, new_art_name in find_folder_artwork(d):
+                if f in seen_artwork or f in claimed_sidecars:
+                    continue
+                seen_artwork.add(f)
+                rows.append(Row(original=f, proposed=new_art_name, row_type="Artwork"))
 
     folder_name = suggest_title_year_folder(folder_title, folder_year) if folder_title else None
-    return ScanResult(rows=rows, folder_name=folder_name, seasons=sorted(seasons_seen))
+    return ScanResult(rows=rows, folder_name=folder_name, seasons=sorted(seasons_seen),
+                       pending=list(pending_by_key.values()))
 
 
 def apply_rename(rows: list[Row], target_dir: Path, rename_folder_to: Optional[str] = None
@@ -392,6 +546,35 @@ class QueueItem:
     sync_sidecars: bool
     use_tmdb: bool
     title_override: Optional[str] = None
+    multi_episode: bool = True
     rows: list[Row] = field(default_factory=list)
     folder_name: Optional[str] = None
+    pending: list[PendingChoice] = field(default_factory=list)
     status: str = "Pending"
+
+
+# ---------------------------------------------------------------------------
+# Update check
+# ---------------------------------------------------------------------------
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    v = v.lstrip("vV")
+    parts = []
+    for p in v.split("."):
+        digits = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def check_for_update(current_version: str = APP_VERSION, timeout: float = 4.0) -> Optional[str]:
+    """Returns the latest release tag on GitHub if it's newer than
+    current_version, else None (including on any network failure)."""
+    try:
+        r = requests.get(GITHUB_RELEASES_API, timeout=timeout)
+        r.raise_for_status()
+        tag = r.json().get("tag_name")
+        if tag and _version_tuple(tag) > _version_tuple(current_version):
+            return tag
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    return None
