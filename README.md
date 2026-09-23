@@ -15,10 +15,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
 </p>
 
-<p align="center">
-  <img src="assets/screenshot.png" width="820" alt="MediaStager screenshot — batch queue and rename preview">
-</p>
-
 Point it at a messy folder — or several at once — and it proposes correct
 `Show Name S01E02.ext` / `Movie Name (Year).ext` filenames and correct
 folder names, using [`guessit`](https://github.com/guessit-io/guessit) for
